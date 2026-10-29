@@ -1,11 +1,12 @@
 name: aps-sistema
 
 networks:
+  default:
   aps-net:
     external: true
 
 services:
-  # 1. Banco de Dados PostgreSQL (Cota ajustada: 0.20 CPU)
+  # 1. Banco de Dados PostgreSQL (Cota: 0.20 vCPU)
   postgres-dist:
     image: postgres:16-alpine
     environment:
@@ -32,52 +33,53 @@ services:
       - ./init.sql:/init.sql:ro
     entrypoint: ["/bin/sh", "-c"]
     command: >
-      for i in $$(seq 1 30); do
-        psql -h postgres-dist -U iot -d telemetria -f /init.sql && exit 0
+      sh -c '
+      until psql -h postgres-dist -U iot -d telemetria -f /init.sql; do
+        echo "Aguardando criação das tabelas no PostgreSQL..."
         sleep 1
       done
-      exit 1
+      echo "Tabelas criadas com sucesso!"
+      '
     depends_on:
       postgres-dist:
         condition: service_healthy
 
-  # 2. Filas de Mensagens (RabbitMQ - Cota: 0.15 CPU)
-  rabbitmq:
-    image: rabbitmq:3-management-alpine
+  # 2. Redis In-Memory Queue (Cota: 0.05 vCPU)
+  redis:
+    image: redis:alpine
     deploy:
       resources:
         limits:
-          cpus: '0.15'
-          memory: 256M
+          cpus: '0.05'
+          memory: 64M
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
 
-  # 3. Réplicas de Aplicação API Ingestão (4 instâncias x 0.05 CPU)
+  # 3. Réplicas da Aplicação Go (6 instâncias x 0.05 vCPU = 0.30 vCPU)
   app-node:
     build:
       context: .
       dockerfile: Dockerfile.monolito
     environment:
       DATABASE_URL: postgres://iot:iot@postgres-dist:5432/telemetria?sslmode=disable
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_URL: redis:6379
       GOMAXPROCS: 2
     deploy:
-      replicas: 4
+      replicas: 6
       resources:
         limits:
           cpus: '0.05'
           memory: 64M
     depends_on:
-      rabbitmq:
+      redis:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
 
-  # 4. Proxy Reverso e Load Balancer (Nginx - Cota: 0.05 CPU)
-  # Publica na rede aps-net sob o alias obrigatório 'aps-app' na porta 8080
+  # 4. Proxy Reverso Nginx (Cota: 0.05 vCPU) - Exposto na rede aps-net com o alias 'aps-app'
   aps-app:
     image: nginx:alpine
     ports:
@@ -92,6 +94,7 @@ services:
     networks:
       default:
       aps-net:
-        aliases: [aps-app]
+        aliases:
+          - aps-app
     depends_on:
       - app-node
