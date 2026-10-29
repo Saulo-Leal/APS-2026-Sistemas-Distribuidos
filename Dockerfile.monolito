@@ -1,0 +1,17 @@
+# Dockerfile.monolito — build multi-stage do monolito Go.
+# O go.mod e gerado dentro do build (o projeto nao versiona go.mod na raiz).
+# A versao do pgx e fixada: sem pin, cada build baixa a ultima release e o
+# binario deixa de ser reproduzivel entre maquinas.
+FROM golang:1.25-alpine AS builder
+WORKDIR /src
+COPY main.go ./
+RUN go mod init monitoramento/monolito \
+ && go get github.com/jackc/pgx/v5@v5.11.0 \
+ && go mod tidy \
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/monolito main.go
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /out/monolito /usr/local/bin/monolito
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/monolito"]

@@ -1,0 +1,87 @@
+# docker-compose.monolito.yml — SISTEMA SOB TESTE (baseline Cenário A)
+#
+# Toda a soma de limits.cpus da solução vive NESTE arquivo (auditoria do
+# orçamento). Soma atual: 0.05 (aplicação) + 0.15 (postgres) = 0.20.
+# O serviço db-init não declara cota porque roda uma vez e encerra.
+#
+# Registra os aliases do contrato na rede externa: aps-app (entrada HTTP)
+# e aps-db-master (master do banco).
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=iot
+      - POSTGRES_PASSWORD=iot
+      - POSTGRES_DB=telemetria
+    deploy:
+      resources:
+        limits:
+          cpus: '0.8'
+          memory: 256M
+    networks:
+      aps-net:
+        aliases: [aps-db-master]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iot -d telemetria"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  db-init:
+    image: postgres:16-alpine
+    environment:
+      - PGPASSWORD=iot
+    volumes:
+      - ./init.sql:/init.sql:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 30); do
+          psql -h postgres -U iot -d telemetria -f /init.sql && exit 0
+          sleep 1
+        done
+        echo "Falha ao aplicar init.sql" && exit 1
+    networks: [aps-net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  sistema-monolito:
+    build:
+      context: .
+      dockerfile: Dockerfile.monolito
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=postgres://iot:iot@postgres:5432/telemetria?sslmode=disable
+      - GOMAXPROCS=2
+      - DB_MAX_CONNS=5
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '0.05'
+          memory: 64M
+    networks:
+      aps-net:
+        aliases: [aps-app]
+    # O healthcheck roda um wget DENTRO do container da aplicação, e o
+    # handler /health faz PingContext no banco. Com interval de 1s isso
+    # consumia parte da cota de 0.05 vCPU respondendo a verificações em vez
+    # de atender carga — sem produzir erro visível. 30s é suficiente.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+networks:
+  aps-net:
+    external: true

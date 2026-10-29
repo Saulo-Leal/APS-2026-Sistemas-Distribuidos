@@ -1,0 +1,70 @@
+name: aps-teste
+
+services:
+
+  wait-app:
+    image: alpine:3.20
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Aguardando a aplicacao em http://aps-app:8080/health ..."
+        for i in $$(seq 1 60); do
+          if wget -qO- http://aps-app:8080/health >/dev/null 2>&1; then
+            echo "Aplicacao pronta."
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "Aplicacao nao ficou pronta a tempo."
+        exit 1
+    networks:
+      - aps-net
+
+  stress-test:
+    image: grafana/k6:0.50.0
+    environment:
+      BASE_URL: http://aps-app:8080
+      RUN_DIR: ${RUN_DIR:-resultados}
+      PEAK_START: ${PEAK_START:-30}
+      READ_RATE: ${READ_RATE:-50}
+      WRITE_RATE: ${WRITE_RATE:-4}
+      PEAK_FACTOR: ${PEAK_FACTOR:-3}
+      BATCH_MIN: ${BATCH_MIN:-10}
+      BATCH_MAX: ${BATCH_MAX:-60}
+      READ_POOL_RATIO: ${READ_POOL_RATIO:-0.6}
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p "$$RUN_DIR"
+        k6 run --summary-export="$$RUN_DIR/report.json" \
+               --out json="$$RUN_DIR/stream.json" \
+               script.js
+    networks:
+      - aps-net
+    depends_on:
+      wait-app:
+        condition: service_completed_successfully
+
+  avaliador-notas:
+    image: golang:1.25-alpine
+    environment:
+      API_BASE_URL: http://aps-app:8080
+      RUN_DIR: ${RUN_DIR:-resultados}
+      DRAIN_TIMEOUT: ${DRAIN_TIMEOUT:-90}
+    volumes:
+      - .:/app
+    working_dir: /app
+    entrypoint: ["go"]
+    command: ["run", "avaliar_justo.go"]
+    networks:
+      - aps-net
+    depends_on:
+      stress-test:
+        condition: service_completed_successfully
+
+networks:
+  aps-net:
+    external: true
