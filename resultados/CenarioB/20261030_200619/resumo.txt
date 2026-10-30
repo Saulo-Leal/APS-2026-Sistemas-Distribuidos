@@ -1,0 +1,12 @@
+Cenario B
+Compose: docker-compose.distribuido.yaml
+Execucao: 20261030_200619
+
+Enviados:    29702
+Rejeitados:  0
+Gravados:    29702
+Taxa persistencia: 100.00%
+Divergentes: 0
+Fantasmas:   0
+Perdidas:    0
+Duplicatas:  0

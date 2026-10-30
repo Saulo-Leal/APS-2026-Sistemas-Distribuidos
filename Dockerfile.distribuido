@@ -1,0 +1,18 @@
+# Dockerfile.distribuido — build multi-stage da aplicacao Go do Cenario B (distribuido).
+# O go.mod e gerado dentro do build (o projeto nao versiona go.mod na raiz).
+# As versoes de lib/pq e go-redis sao fixadas: sem pin, cada build baixa a ultima release e o
+# binario deixa de ser reproduzivel entre maquinas.
+FROM golang:1.25-alpine AS builder
+WORKDIR /src
+COPY main.go ./
+RUN go mod init monitoramento/monolito \
+ && go get github.com/lib/pq@v1.10.9 \
+ && go get github.com/redis/go-redis/v9@v9.7.0 \
+ && go mod tidy \
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/monolito main.go
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /out/monolito /usr/local/bin/monolito
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/monolito"]

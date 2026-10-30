@@ -1,22 +1,28 @@
 name: aps-sistema
 
+# ORCAMENTO DE CPU (teto 0.80 vCPU, soma de limits.cpus; db-init roda e encerra):
+#   postgres-dist 0.40 + 6 x app-node 0.05 (0.30) + nginx 0.05 + redis 0.05 = 0.80
+
 networks:
   default:
   aps-net:
     external: true
 
 services:
-  # 1. Banco de Dados PostgreSQL (Cota: 0.20 vCPU)
+  # 1. Banco de Dados PostgreSQL (Cota: 0.40 vCPU)
   postgres-dist:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: iot
       POSTGRES_PASSWORD: iot
       POSTGRES_DB: telemetria
+    # synchronous_commit=off: nao espera o flush do WAL a cada commit (maior vazao;
+    # em queda do servidor pode perder alguns ms de commits, sem corromper o banco)
+    command: ["postgres", "-c", "synchronous_commit=off", "-c", "max_wal_size=512MB", "-c", "checkpoint_timeout=15min"]
     deploy:
       resources:
         limits:
-          cpus: '0.20'
+          cpus: '0.40'
           memory: 256M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U iot -d telemetria"]
@@ -32,14 +38,14 @@ services:
     volumes:
       - ./init.sql:/init.sql:ro
     entrypoint: ["/bin/sh", "-c"]
-    command: >
-      sh -c '
-      until psql -h postgres-dist -U iot -d telemetria -f /init.sql; do
-        echo "Aguardando criação das tabelas no PostgreSQL..."
-        sleep 1
-      done
-      echo "Tabelas criadas com sucesso!"
-      '
+    command:
+      - |
+        for i in $$(seq 1 30); do
+          psql -v ON_ERROR_STOP=1 -h postgres-dist -U iot -d telemetria -f /init.sql && echo "Tabelas criadas com sucesso!" && exit 0
+          echo "Aguardando criacao das tabelas no PostgreSQL..."
+          sleep 1
+        done
+        echo "Falha ao aplicar init.sql" && exit 1
     depends_on:
       postgres-dist:
         condition: service_healthy
@@ -47,6 +53,9 @@ services:
   # 2. Redis In-Memory Queue (Cota: 0.05 vCPU)
   redis:
     image: redis:alpine
+    # sem snapshots em disco (economiza CPU); teto de memoria: se encher, o RPUSH
+    # falha e a aplicacao grava direto no banco (fallback)
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "48mb", "--maxmemory-policy", "noeviction"]
     deploy:
       resources:
         limits:
@@ -62,17 +71,27 @@ services:
   app-node:
     build:
       context: .
-      dockerfile: Dockerfile.monolito
+      dockerfile: Dockerfile.distribuido
     environment:
       DATABASE_URL: postgres://iot:iot@postgres-dist:5432/telemetria?sslmode=disable
       REDIS_URL: redis:6379
       GOMAXPROCS: 2
+      DB_MAX_CONNS: 3
+      DB_MAX_IDLE: 3
+      QUEUE_WORKERS: 2
     deploy:
       replicas: 6
       resources:
         limits:
           cpus: '0.05'
           memory: 64M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+      start_interval: 2s
     depends_on:
       redis:
         condition: service_healthy
@@ -85,7 +104,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./Nginx.conf:/etc/nginx/nginx.conf:ro
     deploy:
       resources:
         limits:
@@ -97,4 +116,5 @@ services:
         aliases:
           - aps-app
     depends_on:
-      - app-node
+      app-node:
+        condition: service_healthy

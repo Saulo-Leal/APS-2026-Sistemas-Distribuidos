@@ -9,6 +9,11 @@ package main
 //   GET  /audit/contagem
 //   GET  /audit/medidas?limit=&cursor=
 //
+// Write path: a whole batch is stored with ONE SQL statement (bulkInsertSQL).
+// When REDIS_URL is set (distributed scenario) POST /telemetria only validates
+// and enqueues the request body in Redis (202 Accepted); queue workers in each
+// replica persist it. /audit/* waits for the queue to drain before answering.
+//
 // Contract fixes applied in this revision:
 //
 //   1. POST /telemetria accepts a batch of ONE measurement. Only an empty
@@ -49,14 +54,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
 // ---------- Config ----------
@@ -81,8 +89,15 @@ var (
 	databaseURL = envString("DATABASE_URL", "postgres://iot:iot@postgres:5432/telemetria?sslmode=disable")
 	listenAddr  = envString("LISTEN_ADDR", ":8080")
 
-	stmtInsertMeasurement *sql.Stmt
-	stmtUpsertIndex       *sql.Stmt
+	// REDIS_URL vazio = modo monolito (escrita direta no banco).
+	// REDIS_URL definido = escrita assincrona via fila Redis.
+	redisAddr = envString("REDIS_URL", "")
+	rdb       *redis.Client
+)
+
+const (
+	queueKey      = "aps:fila"
+	processingKey = "aps:processando"
 )
 
 // ---------- Timestamp canônico ----------
@@ -191,17 +206,204 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "pronto"})
 }
 
-func handleTelemetry(w http.ResponseWriter, r *http.Request) {
+// ---------- Preparo e insercao em lote ----------
+
+type preparedRow struct {
+	sensorID string
+	ts       string // timestamp canonico (o mesmo usado no hash)
+	raw      string
+	hash     string
+	index    float64
+}
+
+// validMeasurement aplica as regras de rejeicao sem custo de hash.
+func validMeasurement(m measurementInput) bool {
+	if m.SensorID == "" || m.RawPacket == "" {
+		return false
+	}
+	_, err := parseCanonicalTimestamp(m.Timestamp)
+	return err == nil
+}
+
+func prepareRows(ms []measurementInput) ([]preparedRow, int) {
+	rows := make([]preparedRow, 0, len(ms))
+	rejected := 0
+	for _, m := range ms {
+		if !validMeasurement(m) {
+			rejected++
+			continue
+		}
+		ts, _ := parseCanonicalTimestamp(m.Timestamp)
+		canonical := canonicalTimestamp(ts)
+		rows = append(rows, preparedRow{
+			sensorID: m.SensorID,
+			ts:       canonical,
+			raw:      m.RawPacket,
+			hash:     computeMeasurementHash(m.SensorID, canonical, m.RawPacket),
+			index: humidex(m.Metrics.Microclimate.TemperatureCelsius,
+				m.Metrics.Microclimate.RelativeHumidity),
+		})
+	}
+	return rows, rejected
+}
+
+// bulkInsertSQL grava o lote INTEIRO em um unico comando (uma ida ao banco):
+// insere as medicoes (duplicatas ignoradas) e atualiza o indice de calor de
+// cada sensor com o valor da ultima medicao realmente inserida. Substitui o
+// padrao anterior de transacao + SAVEPOINT + 2 comandos por medicao.
+const bulkInsertSQL = `
+WITH input AS (
+	SELECT * FROM unnest($1::text[], $2::timestamptz[], $3::text[], $4::text[], $5::float8[])
+		WITH ORDINALITY AS t(sensor_id, ts, raw, hash, idx, ord)
+),
+ins AS (
+	INSERT INTO medicoes (sensor_id, timestamp, raw_packet, hash, criado_em)
+	SELECT sensor_id, ts, raw, hash, now() FROM input ORDER BY ord
+	ON CONFLICT (sensor_id, timestamp) DO NOTHING
+	RETURNING sensor_id, timestamp
+),
+last_idx AS (
+	SELECT DISTINCT ON (i.sensor_id) i.sensor_id, i.idx
+	FROM input i
+	JOIN ins ON ins.sensor_id = i.sensor_id AND ins.timestamp = i.ts
+	ORDER BY i.sensor_id, i.ord DESC
+),
+upd AS (
+	INSERT INTO indices_calor (sensor_id, indice, atualizado_em)
+	SELECT sensor_id, idx, now() FROM last_idx
+	ON CONFLICT (sensor_id) DO UPDATE
+		SET indice = EXCLUDED.indice, atualizado_em = now()
+)
+SELECT count(*) FROM ins`
+
+const maxRowsPerStatement = 1000
+
+// insertRows devolve quantas linhas foram realmente inseridas (o resto era duplicata).
+func insertRows(ctx context.Context, rows []preparedRow) (int, error) {
+	total := 0
+	for start := 0; start < len(rows); start += maxRowsPerStatement {
+		end := start + maxRowsPerStatement
+		if end > len(rows) {
+			end = len(rows)
+		}
+		chunk := rows[start:end]
+
+		sensors := make([]string, len(chunk))
+		tss := make([]string, len(chunk))
+		raws := make([]string, len(chunk))
+		hashes := make([]string, len(chunk))
+		idxs := make([]float64, len(chunk))
+		for i, r := range chunk {
+			sensors[i], tss[i], raws[i], hashes[i], idxs[i] = r.sensorID, r.ts, r.raw, r.hash, r.index
+		}
+
+		var inserted int
+		if err := db.QueryRowContext(ctx, bulkInsertSQL,
+			pq.Array(sensors), pq.Array(tss), pq.Array(raws), pq.Array(hashes), pq.Array(idxs),
+		).Scan(&inserted); err != nil {
+			return total, err
+		}
+		total += inserted
+	}
+	return total, nil
+}
+
+// ---------- Fila Redis (modo distribuido) ----------
+
+func initRedis() {
+	if redisAddr == "" {
+		return
+	}
+	var opt *redis.Options
+	if strings.HasPrefix(redisAddr, "redis://") {
+		o, err := redis.ParseURL(redisAddr)
+		if err != nil {
+			log.Printf("aviso: REDIS_URL invalida, fila desativada: %v", err)
+			return
+		}
+		opt = o
+	} else {
+		opt = &redis.Options{Addr: redisAddr}
+	}
+	client := redis.NewClient(opt)
+	for i := 0; i < 30; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := client.Ping(ctx).Err()
+		cancel()
+		if err == nil {
+			rdb = client
+			log.Printf("fila Redis ativa em %s", redisAddr)
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	log.Printf("aviso: Redis indisponivel, usando escrita direta no banco")
+}
+
+// processBody grava no banco um corpo de requisicao que estava na fila.
+func processBody(ctx context.Context, body string) error {
 	var batch batchInput
-	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+	if err := json.Unmarshal([]byte(body), &batch); err != nil {
+		log.Printf("aviso: item invalido descartado da fila: %v", err)
+		return nil
+	}
+	rows, _ := prepareRows(batch.Measurements)
+	_, err := insertRows(ctx, rows)
+	return err
+}
+
+// queueWorker move um item da fila para a lista "processando" (atomico),
+// grava no banco e so entao o remove. Em erro, devolve o item a fila.
+func queueWorker() {
+	ctx := context.Background()
+	for {
+		body, err := rdb.BLMove(ctx, queueKey, processingKey, "LEFT", "RIGHT", time.Second).Result()
+		if err != nil {
+			if !errors.Is(err, redis.Nil) {
+				log.Printf("aviso: falha ao ler a fila: %v", err)
+				time.Sleep(500 * time.Millisecond)
+			}
+			continue
+		}
+		if err := processBody(ctx, body); err != nil {
+			log.Printf("aviso: falha ao gravar item da fila, devolvendo: %v", err)
+			rdb.RPush(ctx, queueKey, body)
+			time.Sleep(200 * time.Millisecond)
+		}
+		rdb.LRem(ctx, processingKey, 1, body)
+	}
+}
+
+// waitQueueDrained faz os endpoints de auditoria enxergarem tudo que ja foi
+// aceito: espera (ate 15s) a fila e a lista "processando" esvaziarem.
+func waitQueueDrained(ctx context.Context) {
+	if rdb == nil {
+		return
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		pending, err1 := rdb.LLen(ctx, queueKey).Result()
+		inflight, err2 := rdb.LLen(ctx, processingKey).Result()
+		if err1 != nil || err2 != nil || (pending == 0 && inflight == 0) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func handleTelemetry(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 8<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"erro": "corpo invalido"})
+		return
+	}
+	var batch batchInput
+	if err := json.Unmarshal(body, &batch); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"erro": "corpo JSON invalido"})
 		return
 	}
 
-	// FIX 1 — A batch of ONE measurement is valid. Only an empty batch is
-	// rejected. The load probe sends one measurement per request to isolate
-	// the per-request HTTP cost, so enforcing a minimum of 5 here would make
-	// that probe abort on its very first call.
+	// Um lote de UMA medicao e valido. So o lote vazio e rejeitado.
 	if len(batch.Measurements) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"erro": "lote vazio"})
 		return
@@ -209,77 +411,43 @@ func handleTelemetry(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	received := len(batch.Measurements)
-	persisted := 0
-	rejected := 0
-	duplicates := 0
 
-	tx, err := db.BeginTx(ctx, nil)
+	// Modo distribuido: valida barato, enfileira o corpo original e responde 202.
+	if rdb != nil {
+		valid := 0
+		for _, m := range batch.Measurements {
+			if validMeasurement(m) {
+				valid++
+			}
+		}
+		if valid == 0 {
+			writeJSON(w, http.StatusOK, ingestResponse{TotalReceived: received, TotalRejected: received})
+			return
+		}
+		if err := rdb.RPush(ctx, queueKey, body).Err(); err == nil {
+			writeJSON(w, http.StatusAccepted, ingestResponse{
+				TotalReceived:  received,
+				TotalPersisted: valid, // aceitas para persistencia (gravacao assincrona)
+				TotalRejected:  received - valid,
+			})
+			return
+		}
+		log.Printf("aviso: falha ao enfileirar, gravando direto no banco: %v", err)
+	}
+
+	// Modo monolito (ou fallback): grava direto, em uma unica ida ao banco.
+	rows, rejected := prepareRows(batch.Measurements)
+	inserted, err := insertRows(ctx, rows)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"erro": "falha ao abrir transacao"})
+		log.Printf("aviso: falha ao gravar lote: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"erro": "falha ao gravar lote"})
 		return
 	}
-	defer tx.Rollback()
-
-	insertStmt := tx.StmtContext(ctx, stmtInsertMeasurement)
-	defer insertStmt.Close()
-	indexStmt := tx.StmtContext(ctx, stmtUpsertIndex)
-	defer indexStmt.Close()
-
-	for i, m := range batch.Measurements {
-		ts, err := parseCanonicalTimestamp(m.Timestamp)
-		if err != nil || m.SensorID == "" || m.RawPacket == "" {
-			rejected++
-			continue
-		}
-
-		canonical := canonicalTimestamp(ts)
-		hash := computeMeasurementHash(m.SensorID, canonical, m.RawPacket)
-
-		// FIX 4 — SAVEPOINT per row. A row error rolls back only that row;
-		// the transaction survives and the rest of the batch is stored.
-		savepoint := fmt.Sprintf("sp_%d", i)
-		if _, err := tx.ExecContext(ctx, "SAVEPOINT "+savepoint); err != nil {
-			rejected++
-			continue
-		}
-
-		res, err := insertStmt.ExecContext(ctx, m.SensorID, ts, m.RawPacket, hash)
-		if err != nil {
-			tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT "+savepoint)
-			rejected++
-			continue
-		}
-		tx.ExecContext(ctx, "RELEASE SAVEPOINT "+savepoint)
-
-		// A duplicate (sensor_id, timestamp) is already stored: the row
-		// exists, so it counts as persisted, not as a loss.
-		persisted++
-
-		affected, _ := res.RowsAffected()
-		if affected == 0 {
-			duplicates++
-			continue
-		}
-
-		index := humidex(m.Metrics.Microclimate.TemperatureCelsius,
-			m.Metrics.Microclimate.RelativeHumidity)
-		if _, err := indexStmt.ExecContext(ctx, m.SensorID, index); err != nil {
-			// The measurement is stored; the index will be refreshed by the
-			// next measurement of the same sensor.
-			log.Printf("aviso: falha ao atualizar indice do sensor %s: %v", m.SensorID, err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"erro": "falha ao confirmar transacao"})
-		return
-	}
-
 	writeJSON(w, http.StatusOK, ingestResponse{
 		TotalReceived:  received,
-		TotalPersisted: persisted,
+		TotalPersisted: len(rows), // duplicata ja esta gravada: conta como persistida
 		TotalRejected:  rejected,
-		TotalDuplicate: duplicates,
+		TotalDuplicate: len(rows) - inserted,
 	})
 }
 
@@ -314,6 +482,7 @@ func handleHeatIndex(w http.ResponseWriter, r *http.Request) {
 
 func handleAuditCount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	waitQueueDrained(ctx)
 	var totalMeasurements, totalIndices int64
 
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM medicoes`).Scan(&totalMeasurements); err != nil {
@@ -333,6 +502,7 @@ func handleAuditCount(w http.ResponseWriter, r *http.Request) {
 
 func handleAuditMeasurements(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	waitQueueDrained(ctx)
 
 	limit := 1000
 	if v := r.URL.Query().Get("limit"); v != "" {
@@ -403,6 +573,23 @@ func handleAuditMeasurements(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// waitForDB espera o banco aceitar conexoes e o schema (init.sql) existir.
+func waitForDB() {
+	for i := 1; i <= 60; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		var ok bool
+		err := db.QueryRowContext(ctx,
+			`SELECT to_regclass('public.medicoes') IS NOT NULL AND to_regclass('public.indices_calor') IS NOT NULL`).Scan(&ok)
+		cancel()
+		if err == nil && ok {
+			return
+		}
+		log.Printf("aguardando banco/schema (%d/60) ok=%v err=%v", i, ok, err)
+		time.Sleep(time.Second)
+	}
+	log.Fatalf("banco ou schema indisponivel apos 60 tentativas")
+}
+
 // ---------- Bootstrap ----------
 func main() {
 	var err error
@@ -418,25 +605,14 @@ func main() {
 	db.SetMaxIdleConns(envInt("DB_MAX_IDLE", 4))
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	// FIX 3 — statements prepared once at startup, outside the transaction.
-	stmtInsertMeasurement, err = db.Prepare(`
-		INSERT INTO medicoes (sensor_id, timestamp, raw_packet, hash, criado_em)
-		VALUES ($1, $2, $3, $4, now())
-		ON CONFLICT (sensor_id, timestamp) DO NOTHING`)
-	if err != nil {
-		log.Fatalf("falha ao preparar insercao: %v", err)
+	waitForDB()
+	initRedis()
+	if rdb != nil {
+		workers := envInt("QUEUE_WORKERS", 2)
+		for i := 0; i < workers; i++ {
+			go queueWorker()
+		}
 	}
-	defer stmtInsertMeasurement.Close()
-
-	stmtUpsertIndex, err = db.Prepare(`
-		INSERT INTO indices_calor (sensor_id, indice, atualizado_em)
-		VALUES ($1, $2, now())
-		ON CONFLICT (sensor_id) DO UPDATE
-			SET indice = EXCLUDED.indice, atualizado_em = now()`)
-	if err != nil {
-		log.Fatalf("falha ao preparar indice: %v", err)
-	}
-	defer stmtUpsertIndex.Close()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
