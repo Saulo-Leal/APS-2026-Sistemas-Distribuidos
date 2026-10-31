@@ -1,10 +1,10 @@
 Cenario B
 Compose: docker-compose.distribuido.yaml
-Execucao: 20261030_200619
+Execucao: 20261030_220412
 
-Enviados:    29702
+Enviados:    29773
 Rejeitados:  0
-Gravados:    29702
+Gravados:    29773
 Taxa persistencia: 100.00%
 Divergentes: 0
 Fantasmas:   0
