@@ -22,7 +22,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.40'
+          cpus: '0.08'
           memory: 256M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U iot -d telemetria"]
